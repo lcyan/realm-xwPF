@@ -9,6 +9,7 @@ readonly CONFIG_DIR="/etc/port-traffic-dog"
 readonly CONFIG_FILE="$CONFIG_DIR/config.json"
 readonly LOG_FILE="$CONFIG_DIR/logs/traffic.log"
 readonly TRAFFIC_DATA_FILE="$CONFIG_DIR/traffic_data.json"
+readonly SYSTEMD_SERVICE_NAME="port-traffic-dog-persist.service"
 
 readonly RED='\033[0;31m'
 readonly YELLOW='\033[0;33m'
@@ -109,6 +110,7 @@ check_dependencies() {
 
     setup_script_permissions
     setup_cron_environment
+    setup_systemd_persistence
     # 重启后恢复定时任务
     local active_ports=($(get_active_ports 2>/dev/null || true))
     for port in "${active_ports[@]}"; do
@@ -136,6 +138,49 @@ setup_cron_environment() {
         crontab "$temp_cron" 2>/dev/null || true
         rm -f "$temp_cron"
     fi
+}
+
+setup_systemd_persistence() {
+    # systemd 持久化服务：关机前备份 counter，开机后恢复 nftables 规则和 counter
+    if ! command -v systemctl >/dev/null 2>&1 || [ ! -d /etc/systemd/system ]; then
+        return 0
+    fi
+
+    local service_file="/etc/systemd/system/$SYSTEMD_SERVICE_NAME"
+
+    cat > "$service_file" << EOF
+[Unit]
+Description=Port Traffic Dog nftables counter persistence
+Documentation=https://github.com/zywe03/realm-xwPF
+DefaultDependencies=no
+After=local-fs.target
+Before=shutdown.target reboot.target halt.target
+Conflicts=shutdown.target reboot.target halt.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$SCRIPT_PATH --restore-monitoring
+ExecStop=$SCRIPT_PATH --backup-traffic-data
+TimeoutStartSec=60
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable "$SYSTEMD_SERVICE_NAME" >/dev/null 2>&1 || true
+}
+
+remove_systemd_persistence() {
+    if ! command -v systemctl >/dev/null 2>&1; then
+        return 0
+    fi
+
+    systemctl disable --now "$SYSTEMD_SERVICE_NAME" >/dev/null 2>&1 || true
+    rm -f "/etc/systemd/system/$SYSTEMD_SERVICE_NAME" 2>/dev/null || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
 }
 
 check_root() {
@@ -374,6 +419,20 @@ get_beijing_month_year() {
     echo "$current_day $current_month $current_year"
 }
 
+get_counter_bytes() {
+    local family=$1
+    local table_name=$2
+    local counter_name=$3
+    local counter_output
+
+    if ! counter_output=$(nft list counter "$family" "$table_name" "$counter_name" 2>&1); then
+        log_notification "nftables counter读取失败: $family $table_name $counter_name: $counter_output" 2>/dev/null || true
+        return 1
+    fi
+
+    echo "$counter_output" | grep -o 'bytes [0-9]*' | awk '{print $2}' || true
+}
+
 get_nftables_counter_data() {
     local port=$1
     local table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE")
@@ -382,30 +441,49 @@ get_nftables_counter_data() {
 
     local input_bytes=0
     local output_bytes=0
+    local counter_name
+    local counter_value
+    local read_failed=false
 
     if is_port_range "$port"; then
         local port_safe=$(echo "$port" | tr '-' '_')
         if [ "$billing_mode" = "double" ]; then
-            input_bytes=$(nft list counter $family $table_name "port_${port_safe}_in" 2>/dev/null | \
-                grep -o 'bytes [0-9]*' | awk '{print $2}' || true)
+            counter_name="port_${port_safe}_in"
+            if counter_value=$(get_counter_bytes "$family" "$table_name" "$counter_name"); then
+                input_bytes=${counter_value:-0}
+            else
+                read_failed=true
+            fi
         fi
-        output_bytes=$(nft list counter $family $table_name "port_${port_safe}_out" 2>/dev/null | \
-            grep -o 'bytes [0-9]*' | awk '{print $2}' || true)
+        counter_name="port_${port_safe}_out"
+        if counter_value=$(get_counter_bytes "$family" "$table_name" "$counter_name"); then
+            output_bytes=${counter_value:-0}
+        else
+            read_failed=true
+        fi
     else
         if [ "$billing_mode" = "double" ]; then
-            input_bytes=$(nft list counter $family $table_name "port_${port}_in" 2>/dev/null | \
-                grep -o 'bytes [0-9]*' | awk '{print $2}' || true)
+            counter_name="port_${port}_in"
+            if counter_value=$(get_counter_bytes "$family" "$table_name" "$counter_name"); then
+                input_bytes=${counter_value:-0}
+            else
+                read_failed=true
+            fi
         fi
-        output_bytes=$(nft list counter $family $table_name "port_${port}_out" 2>/dev/null | \
-            grep -o 'bytes [0-9]*' | awk '{print $2}' || true)
+        counter_name="port_${port}_out"
+        if counter_value=$(get_counter_bytes "$family" "$table_name" "$counter_name"); then
+            output_bytes=${counter_value:-0}
+        else
+            read_failed=true
+        fi
     fi
 
-    input_bytes=${input_bytes:-0}
-    output_bytes=${output_bytes:-0}
-    echo "$input_bytes $output_bytes"
+    if [ "$read_failed" = "true" ]; then
+        echo "0 0 missing"
+    else
+        echo "${input_bytes:-0} ${output_bytes:-0} ok"
+    fi
 }
-
-
 
 save_traffic_data() {
     local temp_file=$(mktemp)
@@ -417,17 +495,31 @@ save_traffic_data() {
 
     echo '{}' > "$temp_file"
 
+    local read_failed=false
+
     for port in "${active_ports[@]}"; do
         local traffic_data=($(get_nftables_counter_data "$port"))
-        local current_input=${traffic_data[0]}
-        local current_output=${traffic_data[1]}
+        local current_input=${traffic_data[0]:-0}
+        local current_output=${traffic_data[1]:-0}
+        local read_status=${traffic_data[2]:-ok}
+
+        if [ "$read_status" != "ok" ]; then
+            read_failed=true
+            continue
+        fi
 
         # 只备份有意义的数据
-        if [ $current_input -gt 0 ] || [ $current_output -gt 0 ]; then
+        if [ "$current_input" -gt 0 ] || [ "$current_output" -gt 0 ]; then
             jq ".\"$port\" = {\"input\": $current_input, \"output\": $current_output, \"backup_time\": \"$(get_beijing_time -Iseconds)\"}" \
                 "$temp_file" > "${temp_file}.tmp" && mv "${temp_file}.tmp" "$temp_file"
         fi
     done
+
+    if [ "$read_failed" = "true" ]; then
+        # counter 缺失时不要用空数据覆盖旧备份，避免重启/flush 后把可恢复数据抹掉
+        rm -f "$temp_file"
+        return 1
+    fi
 
     if [ -s "$temp_file" ] && [ "$(jq 'keys | length' "$temp_file" 2>/dev/null)" != "0" ]; then
         mv "$temp_file" "$TRAFFIC_DATA_FILE"
@@ -477,6 +569,56 @@ restore_monitoring_if_needed() {
         restore_traffic_data_from_backup
         restore_all_monitoring_rules >/dev/null 2>&1 || true
     fi
+}
+
+backup_traffic_data_cli() {
+    mkdir -p "$CONFIG_DIR" "$(dirname "$LOG_FILE")"
+    if save_traffic_data; then
+        log_notification "流量数据备份完成"
+        echo -e "${GREEN}流量数据备份完成${NC}"
+    else
+        log_notification "流量数据备份跳过：nftables counter缺失或读取失败"
+        echo -e "${YELLOW}流量数据备份跳过：nftables counter缺失或读取失败${NC}"
+    fi
+}
+
+restore_monitoring_cli() {
+    mkdir -p "$CONFIG_DIR" "$(dirname "$LOG_FILE")"
+    init_nftables
+    setup_exit_hooks
+    restore_monitoring_if_needed
+    log_notification "监控规则恢复检查完成"
+    echo -e "${GREEN}监控规则恢复检查完成${NC}"
+}
+
+check_monitoring_cli() {
+    local table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE")
+    local family=$(jq -r '.nftables.family' "$CONFIG_FILE")
+    local active_ports=($(get_active_ports 2>/dev/null || true))
+    local missing=0
+
+    if ! nft list table "$family" "$table_name" >/dev/null 2>&1; then
+        echo -e "${RED}nftables表不存在: $family $table_name${NC}"
+        return 1
+    fi
+
+    for port in "${active_ports[@]}"; do
+        local port_safe="$port"
+        if is_port_range "$port"; then
+            port_safe=$(echo "$port" | tr '-' '_')
+        fi
+        if ! nft list counter "$family" "$table_name" "port_${port_safe}_out" >/dev/null 2>&1; then
+            echo -e "${RED}缺少counter: port_${port_safe}_out${NC}"
+            missing=$((missing + 1))
+        fi
+    done
+
+    if [ "$missing" -eq 0 ]; then
+        echo -e "${GREEN}监控规则正常，端口数: ${#active_ports[@]}${NC}"
+        return 0
+    fi
+
+    return 1
 }
 
 restore_traffic_data_from_backup() {
@@ -2458,6 +2600,7 @@ uninstall_script() {
 
         remove_telegram_notification_cron 2>/dev/null || true
         remove_wecom_notification_cron 2>/dev/null || true
+        remove_systemd_persistence 2>/dev/null || true
 
         rm -rf "$CONFIG_DIR" 2>/dev/null || true
         rm -f "/usr/local/bin/$SHORTCUT_COMMAND" 2>/dev/null || true
@@ -2793,6 +2936,7 @@ main() {
                 exit 0
                 ;;
             --send-telegram-status)
+                init_config
                 local telegram_script="$CONFIG_DIR/notifications/telegram.sh"
                 if [ -f "$telegram_script" ]; then
                     source "$telegram_script"
@@ -2801,6 +2945,7 @@ main() {
                 exit 0
                 ;;
             --send-wecom-status)
+                init_config
                 local wecom_script="$CONFIG_DIR/notifications/wecom.sh"
                 if [ -f "$wecom_script" ]; then
                     source "$wecom_script"
@@ -2809,8 +2954,21 @@ main() {
                 exit 0
                 ;;
             --send-status)
+                init_config
                 send_status_notification
                 exit 0
+                ;;
+            --backup-traffic-data)
+                backup_traffic_data_cli
+                exit 0
+                ;;
+            --restore-monitoring)
+                restore_monitoring_cli
+                exit 0
+                ;;
+            --check-monitoring)
+                check_monitoring_cli
+                exit $?
                 ;;
         esac
     fi
@@ -2850,6 +3008,9 @@ main() {
                 echo "  --send-status             发送所有启用的状态通知"
                 echo "  --send-telegram-status    发送Telegram状态通知"
                 echo "  --send-wecom-status       发送企业wx 状态通知"
+                echo "  --backup-traffic-data     备份当前nftables流量数据"
+                echo "  --restore-monitoring      恢复nftables监控规则和备份数据"
+                echo "  --check-monitoring        检查nftables监控规则状态"
                 echo "  --reset-port PORT         重置指定端口流量"
                 echo
                 echo -e "${GREEN}快捷命令: $SHORTCUT_COMMAND${NC}"
